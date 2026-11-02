@@ -1,6 +1,7 @@
 /*
  * Copyright (C) 2014 Jared Boone, ShareBrained Technology, Inc.
  * Copyright (C) 2018 Furrtek
+ * Copyright (C) 2026 gullradriel, Nilorea Studio Inc.
  *
  * This file is part of PortaPack.
  *
@@ -32,6 +33,10 @@
 #include "app_settings.hpp"
 #include "radio_state.hpp"
 #include "tone_key.hpp"
+#include "spec_an_sweep.hpp"
+
+#include <array>
+#include <memory>
 
 namespace ui {
 
@@ -41,6 +46,9 @@ class AnalogAudioView;
 class PralineOptionsView : public View {
    public:
     PralineOptionsView(Rect parent_rect, const Style* style);
+
+    // Called after SR changed the sampling rate.
+    std::function<void()> on_sampling_rate_changed{};
 
    private:
     // Layout: SR (Sample Rate), DC (DC Block), QI (Q-Invert), QS (Quarter Shift), D (Decim)
@@ -69,6 +77,13 @@ class PralineOptionsView : public View {
 };
 #endif
 
+enum class AMSpectrumZoomOption : int32_t {
+    X1 = 0,
+    X2 = 6,
+    X3 = 12,
+    X4 = 18,
+};
+
 class AMOptionsView : public View {
    public:
     AMOptionsView(AnalogAudioView* view, Rect parent_rect, const Style* style);
@@ -89,8 +104,20 @@ class AMOptionsView : public View {
     OptionsField zoom_config{
         {UI_POS_X_RIGHT(7), UI_POS_Y(0)},
         7,
-        {{"ZOOM x1", 0},
-         {"ZOOM x2", 6}}  // offset index AM modes array FIR filters.
+        {{"ZOOM x1", (int)AMSpectrumZoomOption::X1},
+         {"ZOOM x2", (int)AMSpectrumZoomOption::X2},
+         {"ZOOM x3", (int)AMSpectrumZoomOption::X3},
+         {"ZOOM x4", (int)AMSpectrumZoomOption::X4}}};
+
+    Text label_squelch{
+        {UI_POS_X(10), UI_POS_Y(0), UI_POS_WIDTH(2), UI_POS_HEIGHT(1)},
+        "SQ"};
+    NumberField field_squelch{
+        {UI_POS_X(13), UI_POS_Y(0)},
+        2,
+        {0, 99},
+        1,
+        ' ',
     };
 };
 
@@ -114,9 +141,10 @@ class AMFMAptOptionsView : public View {
     OptionsField zoom_config{
         {UI_POS_X_RIGHT(7), UI_POS_Y(0)},
         7,
-        {{"ZOOM x1", 0},
-         {"ZOOM x2", 6}}  // offset index array filters.
-    };
+        {{"ZOOM x1", (int)AMSpectrumZoomOption::X1},
+         {"ZOOM x2", (int)AMSpectrumZoomOption::X2},
+         {"ZOOM x3", (int)AMSpectrumZoomOption::X3},
+         {"ZOOM x4", (int)AMSpectrumZoomOption::X4}}};
 };
 
 class NBFMOptionsView : public View {
@@ -204,8 +232,8 @@ class SPECOptionsView : public View {
         }};
 
     Text text_speed{
-        {UI_POS_X(9), UI_POS_Y(0), UI_POS_WIDTH(8), UI_POS_HEIGHT(1)},
-        "SP   /63"};
+        {UI_POS_X(9), UI_POS_Y(0), UI_POS_WIDTH(2), UI_POS_HEIGHT(1)},
+        "SP"};
     NumberField field_speed{
         {UI_POS_X(12), UI_POS_Y(0)},
         2,
@@ -213,6 +241,16 @@ class SPECOptionsView : public View {
         1,
         ' ',
     };
+    // CLS: classic spectrum. FST: the spectrum analyzer engine (windowed,
+    // power averaged FFT, no DC spike on H1), SP sets the speed as in CLS
+    // and the averaging.
+    OptionsField options_sweep{
+        {UI_POS_X(15), UI_POS_Y(0)},
+        3,
+        {
+            {"CLS", 0},
+            {"FST", 1},
+        }};
     Text text_rx_cal{
         {UI_POS_X(19), UI_POS_Y(0), UI_POS_WIDTH(11), UI_POS_HEIGHT(1)},  // 18 (x col.) x char_size,  12 (length) x 8 blanking space to delete previous chars.
         "Rx_IQ_CAL  "};
@@ -242,6 +280,9 @@ class AnalogAudioView : public View {
     uint16_t get_spec_trigger();
     void set_spec_trigger(uint16_t trigger);
 
+    uint8_t get_spec_sweep();
+    void set_spec_sweep(uint8_t sweep);
+
     uint8_t get_spec_iq_phase_calibration_value();
     void set_spec_iq_phase_calibration_value(uint8_t cal_value);
 
@@ -265,10 +306,16 @@ class AnalogAudioView : public View {
     NavigationView& nav_;
     RxRadioState radio_state_{};
     uint8_t iq_phase_calibration_value{15};  // initial default RX IQ phase calibration value , used for both max2837 & max2839
-    uint8_t zoom_factor_am{0};               // initial zoom factor in AM mode
-    uint8_t zoom_factor_amfm{0};             // initial zoom factor in AMFM mode
-    uint8_t previous_AM_mode_option{0};      // GUI 5 AM modes :  (0..4 ) (DSB9K, DSB6K, USB,LSB, CW). Used to select proper FIR filter (0..11) AM mode  + offset 0 (zoom+1) or +6 (if zoom+2)
-    uint8_t previous_zoom{0};                // GUI ZOOM+1, ZOOM+2 , equivalent to two values offset 0 (zoom+1) or +6 (if zoom+2)
+    uint8_t zoom_factor_am{0};
+    uint8_t zoom_factor_amfm{0};
+    uint8_t previous_AM_mode_option{0};
+    uint8_t previous_zoom{0};
+    static constexpr int32_t sliding_limit_zoom_x1 = 50000;
+    static constexpr int32_t sliding_limit_zoom_x2 = 30000;
+    static constexpr int32_t sliding_limit_zoom_x3 = 15000;
+    static constexpr int32_t sliding_limit_zoom_x4 = 6250;
+    rf::Frequency sliding_center_frequency{0};
+    bool sliding_enabled{false};
 
     app_settings::SettingsManager settings_{
         "rx_audio",
@@ -279,6 +326,7 @@ class AnalogAudioView : public View {
             {"zoom_factor_amfm"sv, &zoom_factor_amfm},                // we are saving and restoring AMFM ZOOM factor from Settings.
             {"previous_AM_mode_option"sv, &previous_AM_mode_option},  // we are saving and restoring AMFM ZOOM factor from Settings.
             {"previous_zoom"sv, &previous_zoom},                      // we are saving and restoring AMFM ZOOM factor from Settings.
+            {"spec_sweep"sv, &spec_sweep},                            // SPEC: 0 classic spectrum, 1 spectrum analyzer engine
         }};
 
     const Rect options_view_rect{UI_POS_X(0), UI_POS_Y(1), UI_POS_MAXWIDTH, UI_POS_HEIGHT(1)};
@@ -287,6 +335,28 @@ class AnalogAudioView : public View {
     size_t spec_bw_index = 0;
     uint32_t spec_bw = 20000000;
     uint16_t spec_trigger = 63;
+    uint8_t spec_sweep = 0;
+
+    // SPEC with the spectrum analyzer engine (see spec_an_shared.hpp), only
+    // allocated while in use. Lines go to the waterfall at the classic rate
+    // for the BW and SP, each the average of its own whole sweeps, in the
+    // classic 256 bin layout.
+    static constexpr uint16_t spec_points = 256;
+    static constexpr uint32_t spec_lines = 4;  // per frame at most, as the classic FIFO
+    struct SpecSweep {
+        spec_an::Sweep sweep{};
+        std::array<uint8_t, spec_points> power{};                         // the sweep in progress, by point
+        std::array<int16_t, spec_points> bin_point{};                     // display bin to nearest swept point, -1 if not swept
+        std::array<std::array<uint16_t, spec_points>, spec_lines> sum{};  // whole sweeps, by display bin
+        std::array<uint16_t, spec_lines> sweeps{};                        // in each sum
+        uint8_t next_acc{0};                                              // sum the next sweep goes into
+        int16_t level_offset{0};                                          // to the classic noise level at this SP
+        uint32_t line_samples{0};                                         // the classic takes (SP + 1) DMA buffers per line
+        uint32_t samples{0};                                              // received since the last line
+        systime_t frame_at{0};
+        ChannelSpectrum line{};
+    };
+    std::unique_ptr<SpecSweep> spec_an_sweep{};
 
     RSSI rssi{
         {UI_POS_X(21), 0, UI_POS_WIDTH_REMAINING(21) - UI_POS_WIDTH(2), 4}};
@@ -351,15 +421,38 @@ class AnalogAudioView : public View {
 
     void update_modulation(ReceiverModel::Mode modulation);
 
+    bool spec_sweep_wanted() const;
+    void start_spec_sweep();
+    void stop_spec_sweep();
+    void on_spec_slice(const SpecAnSliceMessage& message);
+    void on_waterfall_frame();
+
     void handle_coded_squelch(uint32_t value);
 
     void on_freqchg(int64_t freq);
+    bool on_frequency_changed(rf::Frequency frequency);
+    void set_frequency_absolute(rf::Frequency frequency);
+    int32_t sliding_limit() const;
+    void reset_sliding_frequency(ReceiverModel::Mode modulation);
 
     MessageHandlerRegistration message_handler_coded_squelch{
         Message::ID::CodedSquelch,
         [this](const Message* p) {
             const auto message = *reinterpret_cast<const CodedSquelchMessage*>(p);
             this->handle_coded_squelch(message.value);
+        }};
+
+    MessageHandlerRegistration message_handler_spec_captured{
+        Message::ID::SpecAnCaptured,
+        [this](const Message* const p) {
+            if (this->spec_an_sweep)
+                this->spec_an_sweep->sweep.on_captured(*reinterpret_cast<const SpecAnCapturedMessage*>(p));
+        }};
+
+    MessageHandlerRegistration message_handler_spec_slice{
+        Message::ID::SpecAnSlice,
+        [this](const Message* const p) {
+            this->on_spec_slice(*reinterpret_cast<const SpecAnSliceMessage*>(p));
         }};
 
     MessageHandlerRegistration message_handler_freqchg{

@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2015 Jared Boone, ShareBrained Technology, Inc.
+ * Copyright (C) 2026 gullradriel, Nilorea Studio Inc.
  * copyleft 2025 zxkmm
  *
  * This file is part of PortaPack.
@@ -72,6 +73,8 @@ class AudioSpectrumView : public View {
 
 class FrequencyScale : public Widget {
    public:
+    /* Receives a frequency offset in Hz for key/touch selection. With live
+     * tuning enabled, encoder events instead pass the raw encoder delta. */
     std::function<void(int32_t offset)> on_select{};
 
     void on_show() override;
@@ -83,8 +86,10 @@ class FrequencyScale : public Widget {
     bool on_touch(const TouchEvent touch) override;
 
     void set_spectrum_sampling_rate(const int new_sampling_rate);
-    void set_channel_filter(const int low_frequency, const int high_frequency, const int transition);
+    void set_channel_filter(const int offset, const int low_frequency, const int high_frequency, const int transition);
     void set_cursor_position(const int32_t position);
+    void set_live_tuning(const bool enabled) { live_tuning = enabled; }
+    bool is_live_tuning() const { return live_tuning; }
 
     void paint(Painter& painter) override;
 
@@ -94,15 +99,19 @@ class FrequencyScale : public Widget {
     int32_t cursor_position{0};
     int spectrum_sampling_rate{0};
     const int spectrum_bins = std::tuple_size<decltype(ChannelSpectrum::db)>::value;
+    int channel_filter_offset{0};
     int channel_filter_low_frequency{0};
     int channel_filter_high_frequency{0};
     int channel_filter_transition{0};
+    bool live_tuning{false};
 
     void clear();
     void clear_background(Painter& painter, const Rect r);
 
     void draw_frequency_ticks(Painter& painter, const Rect r);
     void draw_filter_ranges(Painter& painter, const Rect r);
+    void redraw_filter_cursor(const int old_offset);
+    void restore_tick_lines(Painter& painter, const Rect r, const Rect dirty);
 };
 
 /* NB: These visualizations rely on having a baseband image running.
@@ -129,6 +138,9 @@ class WaterfallWidget : public Widget {
 class WaterfallView : public View {
    public:
     std::function<void(int32_t offset)> on_select{};
+    /* Called on each display frame while running, for owners that feed the
+     * waterfall themselves (the DisplayFrameSync handler is taken here). */
+    std::function<void()> on_frame_sync{};
 
     WaterfallView(const bool cursor = false);
 
@@ -147,6 +159,10 @@ class WaterfallView : public View {
     void set_parent_rect(const Rect new_parent_rect) override;
     void show_audio_spectrum_view(const bool show);
     void load_gradient();
+    void set_live_tuning(const bool enabled) { frequency_scale.set_live_tuning(enabled); }
+
+    /* Draws one line from a spectrum not coming from the baseband FIFO. */
+    void on_channel_spectrum(const ChannelSpectrum& spectrum);
 
    private:
     void update_widgets_rect();
@@ -202,9 +218,10 @@ class WaterfallView : public View {
                 this->audio_spectrum_update = false;
                 this->on_audio_spectrum();
             }
+            if (this->on_frame_sync)
+                this->on_frame_sync();
         }};
 
-    void on_channel_spectrum(const ChannelSpectrum& spectrum);
     void on_audio_spectrum();
 };
 

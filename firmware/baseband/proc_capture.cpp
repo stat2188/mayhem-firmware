@@ -26,6 +26,8 @@
 #include "event_m4.hpp"
 #include "utility.hpp"
 
+#include <algorithm>
+
 using namespace dsp::decimate;
 
 CaptureProcessor::CaptureProcessor() {
@@ -34,6 +36,13 @@ CaptureProcessor::CaptureProcessor() {
 }
 
 void CaptureProcessor::execute(const buffer_c8_t& buffer) {
+    const auto direction = requested_fs4_direction_.load(std::memory_order_relaxed);
+    if (direction != applied_fs4_direction_) {
+        decim_0.configure_fs4(decim_0_taps_, direction);
+        applied_fs4_direction_ = direction;
+        reset_spectrum_capture();
+    }
+
     auto decim_0_out = decim_0.execute(buffer, dst_buffer);
     auto out_buffer = decim_1.execute(decim_0_out, dst_buffer);
 
@@ -49,9 +58,37 @@ void CaptureProcessor::execute(const buffer_c8_t& buffer) {
 
     spectrum_samples += out_buffer.count;
     if (spectrum_samples >= spectrum_interval_samples) {
-        spectrum_samples -= spectrum_interval_samples;
-        channel_spectrum.feed(out_buffer, channel_filter_low_f,
-                              channel_filter_high_f, channel_filter_transition);
+        // Bound the residual when one callback exceeds the update interval.
+        spectrum_samples = std::min(spectrum_samples - spectrum_interval_samples, spectrum_interval_samples);
+        spectrum_capture_credit = std::min<size_t>(256, spectrum_capture_credit + std::min<size_t>(out_buffer.count, 256));
+    }
+    // Preserve the old frame cadence, but collect each frame contiguously.
+    if (!spectrum_capture_remaining && spectrum_capture_credit == 256) {
+        spectrum_capture_credit = 0;
+        spectrum_capture_remaining = 256;
+    }
+    feed_spectrum(out_buffer);
+}
+
+void CaptureProcessor::reset_spectrum_capture() {
+    // Message handling can be preempted by the baseband processing thread.
+    chSysLock();
+    channel_spectrum.discard_partial();
+    spectrum_capture_remaining = 0;
+    spectrum_capture_credit = 0;
+    spectrum_samples = 0;
+    chSysUnlock();
+}
+
+void CaptureProcessor::feed_spectrum(const buffer_c16_t& buffer) {
+    if (!spectrum_capture_remaining || !buffer.count) return;
+    const size_t take = std::min<size_t>(buffer.count, spectrum_capture_remaining);
+    // No surplus samples enter a second frame, even with 512-sample buffers.
+    if (channel_spectrum.feed({buffer.p, take, buffer.sampling_rate},
+                              channel_filter_low_f, channel_filter_high_f, channel_filter_transition)) {
+        spectrum_capture_remaining = 0;
+    } else {
+        spectrum_capture_remaining -= take;
     }
 }
 
@@ -67,8 +104,18 @@ void CaptureProcessor::on_beep_message(const AudioBeepMessage& message) {
 
 void CaptureProcessor::on_message(const Message* const message) {
     switch (message->id) {
+        case Message::ID::RxFs4Config:
+            requested_fs4_direction_.store(
+                static_cast<const RxFs4ConfigMessage*>(message)->direction,
+                std::memory_order_relaxed);
+            break;
+
         case Message::ID::UpdateSpectrum:
+            channel_spectrum.on_message(message);
+            break;
+
         case Message::ID::SpectrumStreamingConfig:
+            reset_spectrum_capture();
             channel_spectrum.on_message(message);
             break;
 
@@ -114,7 +161,6 @@ void CaptureProcessor::sample_rate_config(const SampleRateConfigMessage& message
 
     // The spectrum update interval controls how often the waterfall is fed new samples.
     spectrum_interval_samples = sample_rate / (spectrum_rate_hz * oversample_correction);
-    spectrum_samples = 0;
 
     // For high sample rates, the M4 is busy collecting samples so the
     // waterfall runs slower. Reduce the update interval so it runs faster.
@@ -125,34 +171,34 @@ void CaptureProcessor::sample_rate_config(const SampleRateConfigMessage& message
     switch (message.oversample_rate) {
         case OversampleRate::x4:
             // M4 can't handle 2 decimation passes for sample rates needing x4.
-            decim_0.set<FIRC8xR16x24FS4Decim4>().configure(taps_200k_decim_0.taps);
+            configure_fs4<FIRC8xR16x24FS4Decim4>(taps_200k_decim_0.taps);
             decim_1.set<NoopDecim>();
             break;
 
         case OversampleRate::x8:
             // M4 can't handle 2 decimation passes for sample rates <= 600k.
             if (message.sample_rate < 600'000) {
-                decim_0.set<FIRC8xR16x24FS4Decim4>().configure(taps_200k_decim_0.taps);
+                configure_fs4<FIRC8xR16x24FS4Decim4>(taps_200k_decim_0.taps);
                 decim_1.set<FIRC16xR16x16Decim2>().configure(taps_200k_decim_1.taps);
             } else {
                 // Using 180k taps to provide better filtering with a single pass.
-                decim_0.set<FIRC8xR16x24FS4Decim8>().configure(taps_180k_wfm_decim_0.taps);
+                configure_fs4<FIRC8xR16x24FS4Decim8>(taps_180k_wfm_decim_0.taps);
                 decim_1.set<NoopDecim>();
             }
             break;
 
         case OversampleRate::x16:
-            decim_0.set<FIRC8xR16x24FS4Decim8>().configure(taps_200k_decim_0.taps);
+            configure_fs4<FIRC8xR16x24FS4Decim8>(taps_200k_decim_0.taps);
             decim_1.set<FIRC16xR16x16Decim2>().configure(taps_200k_decim_1.taps);
             break;
 
         case OversampleRate::x32:
-            decim_0.set<FIRC8xR16x24FS4Decim4>().configure(taps_200k_decim_0.taps);
+            configure_fs4<FIRC8xR16x24FS4Decim4>(taps_200k_decim_0.taps);
             decim_1.set<FIRC16xR16x32Decim8>().configure(taps_16k0_decim_1.taps);
             break;
 
         case OversampleRate::x64:
-            decim_0.set<FIRC8xR16x24FS4Decim8>().configure(taps_200k_decim_0.taps);
+            configure_fs4<FIRC8xR16x24FS4Decim8>(taps_200k_decim_0.taps);
             decim_1.set<FIRC16xR16x32Decim8>().configure(taps_16k0_decim_1.taps);
             break;
 
@@ -160,6 +206,7 @@ void CaptureProcessor::sample_rate_config(const SampleRateConfigMessage& message
             chDbgPanic("Unhandled OversampleRate");
             break;
     }
+    reset_spectrum_capture();
 }
 
 void CaptureProcessor::capture_config(const CaptureConfigMessage& message) {

@@ -29,6 +29,7 @@ So include here the .hpp, and add a new element to the protos vector in the cons
 #include "s-ido.hpp"
 #include "s-intertechnov3.hpp"
 #include "s-keeloq.hpp"
+#include "s-superrollo.hpp"
 #include "s-kinggates_stylo_4k.hpp"
 #include "s-linear.hpp"
 #include "s-linear_delta3.hpp"
@@ -85,6 +86,7 @@ class SubGhzDProtos : public FProtoListGeneral {
         protos[FPS_IDO] = new FProtoSubGhzDIdo();
         protos[FPS_INTERTECHNOV3] = new FProtoSubGhzDIntertechnoV3();
         protos[FPS_KEELOQ] = new FProtoSubGhzDKeeLoq();
+        protos[FPS_SUPERROLLO] = new FProtoSubGhzDSuperrollo();
         protos[FPS_KINGGATESSTYLO4K] = new FProtoSubGhzDKinggatesStylo4K();
         protos[FPS_LINEAR] = new FProtoSubGhzDLinear();
         protos[FPS_LINEARDELTA3] = new FProtoSubGhzDLinearDelta3();
@@ -131,7 +133,25 @@ class SubGhzDProtos : public FProtoListGeneral {
         shared_memory.application_queue.push(packet_message);
     }
 
-    void feed(bool level, uint32_t duration) {
+    void feed(bool level, uint32_t duration) override {
+        // Noise chops a weak signal into pieces, and adds lots of short glitches between the pulses. Pieces shorter than any
+        // protocol's pulse (the shortest is ~88us, LaCrosse TX141) are added to the run they are in, and a run is only fed to the
+        // protocols when the level really changes. So all of them get the repaired pulses, and much fewer of them (less CPU).
+        if (duration < GLITCH_US || level == run_level) {
+            run_duration += duration;
+        } else {
+            if (run_duration) feed_all(run_level, run_duration);
+            run_level = level;
+            run_duration = duration;
+        }
+        // a long run (silence) is fed even if it hasn't ended, like the 30 ms pieces from the slicer
+        if (run_duration >= MAX_RUN_US) {
+            feed_all(run_level, run_duration);
+            run_duration = 0;
+        }
+    }
+
+    void feed_all(bool level, uint32_t duration) {
         for (uint8_t i = 0; i < FPS_COUNT; ++i) {
             if (protos[i] != NULL) protos[i]->feed(level, duration);
         }
@@ -139,6 +159,10 @@ class SubGhzDProtos : public FProtoListGeneral {
 
    protected:
     FProtoSubGhzDBase* protos[FPS_COUNT] = {NULL};
+    static constexpr uint32_t GLITCH_US = 60;
+    static constexpr uint32_t MAX_RUN_US = 30000;
+    bool run_level = false;
+    uint32_t run_duration = 0;
 };
 
 #endif

@@ -44,7 +44,22 @@ if(cpp20_supported)
 else()
 	set(USE_CPPOPT "-std=c++17")
 endif()
-set(USE_CPPOPT "${USE_CPPOPT} -fno-rtti -fno-exceptions -Weffc++ -Wuninitialized -Wno-volatile")
+set(USE_CPPOPT "${USE_CPPOPT} -fno-rtti -fno-exceptions -Weffc++ -Wuninitialized")
+
+# C++ standard deprecations that the vendored ChibiOS 2.6 headers use when
+# included from C++: compound assignment to volatile, and the register storage
+# class, which GCC requires to bind a variable to an explicit register
+# (port_lock()/port_unlock() in chcore_v7m.h).
+#
+# Each -Wno-* is passed only when the compiler knows the positive form. GCC
+# accepts an unknown -Wno-* silently, then reports "unrecognized command line
+# option" as soon as any other diagnostic fires.
+foreach(cxx_warning volatile register)
+	check_cxx_compiler_flag("-W${cxx_warning}" cxx_warn_${cxx_warning}_supported)
+	if(cxx_warn_${cxx_warning}_supported)
+		set(USE_CPPOPT "${USE_CPPOPT} -Wno-${cxx_warning}")
+	endif()
+endforeach()
 
 # Enable this if you want the linker to remove unused code and data
 set(USE_LINK_GC yes)
@@ -124,6 +139,7 @@ set(CPPSRC
 	dsp_goertzel.cpp
 	matched_filter.cpp
 	spectrum_collector.cpp
+	filtered_spectrum_collector.cpp
 	tv_collector.cpp
 	stream_input.cpp
 	stream_output.cpp
@@ -345,13 +361,6 @@ set(add_to_firmware TRUE)
 set(MODE_FLAGS "-O3")
 
 
-### ADS-B RX
-
-set(MODE_CPPSRC
-	proc_adsbrx.cpp
-)
-DeclareTargets(PADR adsbrx)
-
 
 ### AFSK TX
 
@@ -360,12 +369,6 @@ set(MODE_CPPSRC
 )
 DeclareTargets(PAFT afsktx)
 
-### APRS RX
-
-set(MODE_CPPSRC
-	proc_aprsrx.cpp
-)
-DeclareTargets(PAPR aprsrx)
 
 
 ### BTLE RX
@@ -381,13 +384,6 @@ set(MODE_CPPSRC
 	proc_ble_tx.cpp
 )
 DeclareTargets(PBTT btletx)
-
-### AIS
-
-set(MODE_CPPSRC
-	proc_ais.cpp
-)
-DeclareTargets(PAIS ais)
 
 ### AM Audio
 
@@ -474,6 +470,7 @@ DeclareTargets(PREP replay)
 
 set(MODE_CPPSRC
 	proc_wideband_spectrum.cpp
+	spec_an_engine.cpp
 )
 DeclareTargets(PSPE wideband_spectrum)
 
@@ -512,9 +509,78 @@ set(MODE_CPPSRC
 )
 DeclareTargets(PFUT flash_utility)
 
-### Place external app and disabled images below so they don't get added to the firmware
-set(add_to_firmware FALSE)
+### Place external app and disabled images below so they don't get added to the firmware, but to the corresponding tier!
 set(MODE_FLAGS "-O3")
+
+###### AFTER THIS LINE ALL LISTED BASEBANDS WILL BE EXTERNAL ON TIER 0, but will be internal on T1, T2
+if(FLASH_TIER EQUAL 0)
+	set(add_to_firmware FALSE)
+endif()
+
+### ADS-B RX
+
+set(MODE_CPPSRC
+	proc_adsbrx.cpp
+)
+DeclareTargets(PADR adsbrx)
+
+
+### ADS-B TX - t0 external
+set(MODE_CPPSRC
+	proc_adsbtx.cpp
+)
+DeclareTargets(PADT adsbtx)
+
+### APRS RX - t0 external
+set(MODE_CPPSRC
+	proc_aprsrx.cpp
+)
+DeclareTargets(PAPR aprsrx)
+
+### AIS - t 0 external
+set(MODE_CPPSRC
+	proc_ais.cpp
+)
+DeclareTargets(PAIS ais)
+
+### Binary Timed stream TX
+
+set(MODE_CPPSRC
+       proc_bint_stream_tx.cpp
+)
+DeclareTargets(POSK bintstream)
+
+
+
+###### AFTER THIS LINE ALL LISTED BASEBANDS WILL BE EXTERNAL ON TIER 0, 1, but will be internal on T2
+if(FLASH_TIER EQUAL 1)
+	set(add_to_firmware FALSE)
+endif()
+
+
+
+### AM TV
+set(MODE_CPPSRC
+	proc_am_tv.cpp
+)
+DeclareTargets(PAMT am_tv)
+
+
+### ProtoView
+
+set(MODE_CPPSRC
+	proc_protoview.cpp
+)
+DeclareTargets(PPVW protoview)
+
+
+
+
+###### AFTER THIS LINE ALL LISTED BASEBANDS WILL BE EXTERNAL ON TIER 2, so it'll be external on all tiers
+if(FLASH_TIER GREATER_EQUAL 2)
+	set(add_to_firmware FALSE)
+endif()
+
 
 ### VOR TX
 
@@ -589,12 +655,6 @@ set(MODE_CPPSRC
 )
 DeclareTargets(PJAM jammer)
 
-### AM TV
-
-set(MODE_CPPSRC
-	proc_am_tv.cpp
-)
-DeclareTargets(PAMT am_tv)
 
 ### GPS Simulator
 
@@ -625,12 +685,6 @@ set(MODE_CPPSRC
 DeclareTargets(PABP audio_beep)
 
 
-### ProtoView
-
-set(MODE_CPPSRC
-	proc_protoview.cpp
-)
-DeclareTargets(PPVW protoview)
 
 
 ### SSTV TX
@@ -655,19 +709,6 @@ set(MODE_CPPSRC
 DeclareTargets(PTPM tpms)
 
 
-### ADS-B TX
-
-set(MODE_CPPSRC
-	proc_adsbtx.cpp
-)
-DeclareTargets(PADT adsbtx)
-
-### Binary Timed stream TX
-
-set(MODE_CPPSRC
-       proc_bint_stream_tx.cpp
-)
-DeclareTargets(POSK bintstream)
 
 
 ### Signal generator
@@ -747,13 +788,6 @@ set(MODE_CPPSRC
 )
 DeclareTargets(PRTT rtty_tx)
 
-### SD over USB
-
-set(MODE_INCDIR
-	${HACKRF_PATH}/firmware
-	${HACKRF_PATH}/firmware/common
-	${HACKRF_PATH}/firmware/libopencm3/include
-)
 
 ### Morse TX
 
@@ -776,6 +810,13 @@ set(MODE_CPPSRC
 )
 DeclareTargets(HUNT signal_hunter)
 
+### RDSRX
+
+set(MODE_CPPSRC
+    proc_rds_rx.cpp
+)
+DeclareTargets(PRRD rds_rx)
+
 
 
 ### Time Sink
@@ -785,6 +826,14 @@ set(MODE_CPPSRC
 )
 DeclareTargets(PTSK time_sink)
 
+### Spectrum Analyzer
+
+set(MODE_CPPSRC
+	proc_spec_an.cpp
+	spec_an_engine.cpp
+)
+DeclareTargets(PSAN spec_an)
+
 
 ### Tetra Rx
 
@@ -792,6 +841,43 @@ set(MODE_CPPSRC
 	proc_tetra.cpp
 )
 DeclareTargets(PTET tetra_rx)
+
+### FT8 RX
+
+set(MODE_CPPSRC
+	proc_ft8_rx.cpp
+	ft8_lib/constants.c
+	ft8_lib/crc.c
+	ft8_lib/decode.c
+	ft8_portapack.c
+	ft8_lib/ldpc.c
+	ft8_lib/message.c
+	ft8_lib/text.c
+)
+# The decoder plus its tables sit close to the 32k external app ceiling, so this image is
+# built for size rather than speed. message.c sets LOG_LEVEL, which makes ft8_lib's
+# debug.h reach for fprintf; defining LOG_PRINTF empty keeps stdio out of the image and
+# leaves the vendored header byte-identical to upstream.
+set(MODE_FLAGS "-Os -DLOG_PRINTF\\(...\\)=")
+DeclareTargets(PFT8 ft8_rx)
+set(MODE_FLAGS "-O3")
+
+### SD over USB
+
+set(MODE_INCDIR
+	${HACKRF_PATH}/firmware
+	${HACKRF_PATH}/firmware/common
+	${HACKRF_PATH}/firmware/libopencm3/include
+	${HACKRF_PATH}/firmware/hackrf_usb
+	sd_over_usb/
+)
+
+### WMBUS Rx
+
+set(MODE_CPPSRC
+	proc_wmbus.cpp
+)
+DeclareTargets(PWMB wmbus_rx)
 
 
 set(MODE_CPPSRC
@@ -801,7 +887,9 @@ set(MODE_CPPSRC
 	sd_over_usb/diskio.c
 	sd_over_usb/sd_over_usb.c
 	sd_over_usb/usb_descriptor.c
-	sd_over_usb/hackrf_core.c
+	sd_over_usb/usb_api_transceiver.c
+	sd_over_usb/cpu_clock.c
+	sd_over_usb/pins.c
 
 	${HACKRF_PATH}/firmware/common/adc.c
 	${HACKRF_PATH}/firmware/common/selftest.c
@@ -828,6 +916,15 @@ set(MODE_CPPSRC
 	${HACKRF_PATH}/firmware/common/rffc5071_spi.c
 	${HACKRF_PATH}/firmware/common/rffc5071.c
 	${HACKRF_PATH}/firmware/common/gpdma.c
+	${HACKRF_PATH}/firmware/common/clock_gen.c
+	${HACKRF_PATH}/firmware/common/cpld_jtag.c
+	${HACKRF_PATH}/firmware/common/leds.c
+	${HACKRF_PATH}/firmware/common/power.c
+	${HACKRF_PATH}/firmware/common/clock_io.c
+	${HACKRF_PATH}/firmware/common/rom_iap.c
+	${HACKRF_PATH}/firmware/common/w25q80bv.c
+	${HACKRF_PATH}/firmware/common/w25q80bv_target.c
+	
 
 	${HACKRF_PATH}/firmware/libopencm3/lib/cm3/nvic.c
 	${HACKRF_PATH}/firmware/libopencm3/lib/cm3/sync.c
@@ -835,10 +932,7 @@ set(MODE_CPPSRC
 	${HACKRF_PATH}/firmware/libopencm3/lib/lpc43xx/timer.c
 	${HACKRF_PATH}/firmware/libopencm3/lib/lpc43xx/i2c.c
 )
-# sd_over_usb has type conflicts with PRALINE (HackRF Pro) - disable for now
-if(NOT BOARD STREQUAL "PRALINE")
 DeclareTargets(PUSB sd_over_usb)
-endif()
 
 
 ### HackRF "factory" firmware

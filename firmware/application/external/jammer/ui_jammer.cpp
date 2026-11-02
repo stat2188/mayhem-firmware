@@ -284,7 +284,7 @@ void JammerView::on_timer() {
 JammerView::JammerView(NavigationView& nav)
     : nav_{nav} {
     Rect view_rect = {0, 3 * 8, screen_width, 80};
-    baseband::run_prepared_image(portapack::memory::map::m4_code.base());
+    baseband::run_image(portapack::spi_flash::image_tag_jammer);
 
     add_children({&tab_view,
                   &view_range_a,
@@ -407,8 +407,26 @@ JammerView::JammerView(NavigationView& nav)
     button_transmit.on_select = [this](Button&) {
         if (jamming || cooling)
             stop_tx();
-        else
-            start_tx();
+        else {
+            if (options_hop.selected_index_value() * 10 < 50) {
+                nav_.display_modal(
+                    "Warning",
+                    "Hopping interval is\nbelow 50ms.\n\n"
+                    "THIS WILL FREEZE\nTHE HACKRF.\n"
+                    "Press RESET button\nto stop.\n\n"
+                    "Are you sure?",
+                    YESNO,
+                    [this](bool choice) {
+                        if (choice) {
+                            chThdSleepMilliseconds(50);
+                            start_tx();
+                        }
+                    },
+                    TRUE);
+            } else {
+                start_tx();
+            }
+        }
     };
 }
 

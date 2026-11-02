@@ -32,10 +32,6 @@
 
 #include "core_control.hpp"
 
-/* Set true to enable additional checks to ensure
- * M4 and M0 are synchronized before passing messages. */
-static constexpr bool enforce_core_sync = true;
-
 /* Set true to enable check for baseband messages getting stuck.
  * This implies the baseband thread is not dequeuing and has probably stalled.
  * NB: This check adds a small amout of overhead to the message sending code
@@ -45,6 +41,8 @@ static constexpr bool check_for_message_hang = true;
 using namespace portapack;
 
 namespace baseband {
+
+void run_prepared_image(const uint32_t m4_code, bool enforce_core_sync = true, const portapack::spi_flash::image_tag_t prepared_image_tag = portapack::spi_flash::image_tag_none);
 
 static void send_message(const Message* const message) {
     // If message is only sent by this function via one thread, no need to check if
@@ -74,7 +72,11 @@ static void send_message(const Message* const message) {
     }
 }
 
-void AMConfig::apply() const {
+void AMConfig::apply(const uint8_t squelch_level) const {
+    apply((AMConfigureMessage::Zoom_waterfall)spectrum_decimation_factor, squelch_level);
+}
+
+void AMConfig::apply(const AMConfigureMessage::Zoom_waterfall spectrum_zoom, const uint8_t squelch_level) const {
     const AMConfigureMessage message{
         taps_6k0_decim_0,             // common FIR filter taps pre-decim_0 to all 6 x AM mod types.(AM-9K, AM-6K, USB, LSB, CW, AMFM-WFAX)
         decim_1,                      // var decim_1 FIR taps filter , variable values , to handle two spectrum decim factor 1 and 2 (zoom) and more APT LPF filtered .
@@ -82,7 +84,8 @@ void AMConfig::apply() const {
         channel,                      // var channel FIR taps filter , variable values, depending selected  AM mode, each one different  (DSB-9K, DSB-6K, USB-3K, LSB-3K,CW,AMFM-WFAX)
         modulation,                   // var parameter . enum class Modulation : int32_t {DSB = 0, SSB = 1, SSB_FM = 2}
         audio_12k_iir_filter_config,  // var parameter , 300 Hz hpf all except Wefax (1.500Hz lpf)
-        spectrum_decimation_factor};  // var parameter , waterfall no zoom : 1 ,for zoom x 2 : 2
+        (size_t)spectrum_zoom,
+        squelch_level};
     send_message(&message);
     audio::set_rate(audio::Rate::Hz_12000);
 }
@@ -343,6 +346,11 @@ void set_spectrum(
     send_message(&message);
 }
 
+void set_audio_ddc_frequency(int32_t frequency) {
+    const AudioDDCConfigMessage message{frequency};
+    send_message(&message);
+}
+
 void set_time_sink(
     const size_t sampling_rate,
     const size_t trigger) {
@@ -463,13 +471,31 @@ void set_hunter_config(uint32_t threshold, uint32_t hangtime_ms, bool start) {
     send_message(&message);
 }
 
+void set_wmbus_config(uint8_t mode) {
+    WMBusPacketMessage message;
+    message.length = mode;  // hacky? yes. ugly? yes. practical? YES (don't waste another message type on it..)
+    send_message(&message);
+}
+
 static bool baseband_image_running = false;
+static bool rx_fs4_supported = false;
+
+bool supports_rx_fs4() {
+    return baseband_image_running && rx_fs4_supported;
+}
+
+void set_rx_fs4_direction(RxFs4Direction direction) {
+    if (supports_rx_fs4()) {
+        const RxFs4ConfigMessage message{direction};
+        send_message(&message);
+    }
+}
 
 bool is_image_running() {
     return baseband_image_running;
 }
 
-void run_image(const spi_flash::image_tag_t image_tag) {
+void run_image(const spi_flash::image_tag_t image_tag, bool enforce_core_sync) {
     if (baseband_image_running) {
         chDbgPanic("BBRunning");
     }
@@ -477,12 +503,19 @@ void run_image(const spi_flash::image_tag_t image_tag) {
     creg::m4txevent::clear();
     shared_memory.clear_baseband_ready();
 
-    m4_init(image_tag, memory::map::m4_code, false);
+    rx_fs4_supported = image_tag == spi_flash::image_tag_am_audio ||
+                       image_tag == spi_flash::image_tag_nfm_audio ||
+                       image_tag == spi_flash::image_tag_wfm_audio ||
+                       image_tag == spi_flash::image_tag_capture;
+    if (!m4_init(image_tag, memory::map::m4_code, false)) {
+        m4_restore_bundled();
+        m4_init_prepared(portapack::memory::map::m4_code.base(), false);
+    }
     baseband_image_running = true;
 
     creg::m4txevent::enable();
 
-    if constexpr (enforce_core_sync) {
+    if (enforce_core_sync) {
         // Wait up to 3 seconds for baseband to start handling events.
         auto count = 3'000u;
         while (!shared_memory.baseband_ready && --count)
@@ -493,7 +526,8 @@ void run_image(const spi_flash::image_tag_t image_tag) {
     }
 }
 
-void run_prepared_image(const uint32_t m4_code) {
+void run_prepared_image(const uint32_t m4_code, bool enforce_core_sync, const spi_flash::image_tag_t prepared_image_tag) {
+    rx_fs4_supported = false;
     if (baseband_image_running) {
         chDbgPanic("BBRunning");
     }
@@ -502,11 +536,13 @@ void run_prepared_image(const uint32_t m4_code) {
     shared_memory.clear_baseband_ready();
 
     m4_init_prepared(m4_code, false);
+    // Only explicitly identified Capture images support application FS4 control.
+    rx_fs4_supported = prepared_image_tag == spi_flash::image_tag_capture;
     baseband_image_running = true;
 
     creg::m4txevent::enable();
 
-    if constexpr (enforce_core_sync) {
+    if (enforce_core_sync) {
         // Wait up to 3 seconds for baseband to start handling events.
         auto count = 3'000u;
         while (!shared_memory.baseband_ready && --count)
@@ -518,6 +554,7 @@ void run_prepared_image(const uint32_t m4_code) {
 }
 
 void shutdown() {
+    rx_fs4_supported = false;
     if (!baseband_image_running) {
         return;
     }
@@ -530,11 +567,15 @@ void shutdown() {
     shared_memory.application_queue.reset();
     // Allow time for the shutdown message to be processed and for the baseband
     // core to stop before starting another image. Otherwise, the M4 may still be
-    // running and cause a crash when the next image is started.
-#ifdef PRALINE
+    // running and cause a crash when the next image is started. A processor whose
+    // destructor joins a worker thread holds the M4 for as long as that thread's
+    // current pass takes, so the wait applies to every target, not only Praline.
     chThdSleepMilliseconds(20);
-#endif
     baseband_image_running = false;
+}
+
+void set_spec_an_config(const SpecAnConfigMessage& message) {
+    send_message(&message);
 }
 
 void spectrum_streaming_start() {

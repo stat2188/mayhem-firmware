@@ -27,6 +27,7 @@
 #include "event_m4.hpp"
 
 #include <array>
+#include <cmath>
 #include "dsp_hilbert.hpp"
 
 // Phase 2: Constructor to start threads AFTER object is fully initialized
@@ -44,11 +45,31 @@ void NarrowbandAMAudio::execute(const buffer_c8_t& buffer) {
         return;
     }
 
+    // Only the processing thread applies frequency-only direction changes.
+    if (requested_fs4_direction_.load(std::memory_order_relaxed) != applied_fs4_direction_)
+        configure_fs4(decim_0_taps_);
+
     const auto decim_0_out = decim_0.execute(buffer, dst_buffer);
-    const auto decim_1_out = decim_1.execute(decim_0_out, dst_buffer);
+    const auto audio_decim_0_out = audio_decim_0.execute(decim_0_out, dst_buffer);
 
-    channel_spectrum.feed(decim_1_out, channel_filter_low_f, channel_filter_high_f, channel_filter_transition);
+    spectrum_samples += decim_0_out.count;
+    if (!spectrum_capture_active &&
+        spectrum_samples >= spectrum_interval_samples) {
+        spectrum_samples -= spectrum_interval_samples;
+        spectrum_capture_active =
+            channel_spectrum.start_capture(spectrum_decimation_factor);
+    }
 
+    if (spectrum_capture_active &&
+        channel_spectrum.feed(
+            audio_decim_0_out,
+            channel_filter_low_f,
+            channel_filter_high_f,
+            channel_filter_transition)) {
+        spectrum_capture_active = false;
+    }
+
+    const auto decim_1_out = translating_decim_1.execute(audio_decim_0_out, dst_buffer);
     const auto decim_2_out = decim_2.execute(decim_1_out, dst_buffer);
     const auto channel_out = channel_filter.execute(decim_2_out, dst_buffer);
 
@@ -56,6 +77,32 @@ void NarrowbandAMAudio::execute(const buffer_c8_t& buffer) {
     feed_channel_stats(channel_out);
 
     auto audio = demodulate(channel_out);  // now 3 AM demodulation types : demod_am, demod_ssb, demod_ssb_fm (for Wefax)
+
+    // SDR++-style power squelch on the complex channel signal (opt-in; 0 = off).
+    // Measures mean channel power, converts to dBFS, and mutes the audio when
+    // the signal is below the user threshold. Carrier-based, so it keys on the
+    // AM carrier (e.g. airband/ATC) rather than on audio-band noise.
+    if (squelch_level > 0 && channel_out.count > 0) {
+        uint64_t sum_mag_sq = 0;
+        for (size_t i = 0; i < channel_out.count; i++) {
+            const int32_t re = channel_out.p[i].real();
+            const int32_t im = channel_out.p[i].imag();
+            sum_mag_sq += static_cast<uint64_t>(re) * re + static_cast<uint64_t>(im) * im;
+        }
+
+        constexpr float full_scale_mag2 = 32768.0f * 32768.0f;
+        const float mean_mag2_norm =
+            static_cast<float>(sum_mag_sq) / (static_cast<float>(channel_out.count) * full_scale_mag2);
+        const float level_dbfs = (mean_mag2_norm > 0.0f) ? mag2_to_dbv_norm(mean_mag2_norm) : -200.0f;
+
+        // Map squelch_level 1..99 to a threshold of -80..-20 dBFS.
+        const float threshold_dbfs = -80.0f + (squelch_level - 1) * (60.0f / 98.0f);
+        if (level_dbfs < threshold_dbfs) {
+            for (size_t i = 0; i < audio.count; i++)
+                audio.p[i] = 0.0f;
+        }
+    }
+
     audio_compressor.execute_in_place(audio);
     audio_output.write(audio);
 }
@@ -82,8 +129,26 @@ buffer_f32_t NarrowbandAMAudio::demodulate(const buffer_c16_t& channel) {
     }
 }
 
+void NarrowbandAMAudio::configure_fs4(const std::array<int16_t, 24>& taps) {
+    // Keep the short first-stage update coherent with the processing thread.
+    chSysLock();
+    decim_0_taps_ = taps;
+    const auto direction = requested_fs4_direction_.load(std::memory_order_relaxed);
+    using Shift = dsp::decimate::FIRC8xR16x24FS4Decim4::Shift;
+    decim_0.configure(decim_0_taps_, 33554432,
+                      direction == RxFs4Direction::Up ? Shift::Up : Shift::Down);
+    applied_fs4_direction_ = direction;
+    chSysUnlock();
+}
+
 void NarrowbandAMAudio::on_message(const Message* const message) {
     switch (message->id) {
+        case Message::ID::RxFs4Config:
+            requested_fs4_direction_.store(
+                static_cast<const RxFs4ConfigMessage*>(message)->direction,
+                std::memory_order_relaxed);
+            break;
+
         case Message::ID::UpdateSpectrum:
         case Message::ID::SpectrumStreamingConfig:
             channel_spectrum.on_message(message);
@@ -97,6 +162,10 @@ void NarrowbandAMAudio::on_message(const Message* const message) {
             capture_config(*reinterpret_cast<const CaptureConfigMessage*>(message));
             break;
 
+        case Message::ID::AudioDDCConfig:
+            ddc_config(*reinterpret_cast<const AudioDDCConfigMessage*>(message));
+            break;
+
         default:
             break;
     }
@@ -106,17 +175,19 @@ void NarrowbandAMAudio::configure(const AMConfigureMessage& message) {
     constexpr size_t decim_0_input_fs = baseband_fs;
     constexpr size_t decim_0_output_fs = decim_0_input_fs / decim_0.decimation_factor;
 
-    constexpr size_t decim_1_input_fs = decim_0_output_fs;
-    constexpr size_t decim_1_output_fs = decim_1_input_fs / decim_1.decimation_factor;
-
+    constexpr size_t audio_decim_0_output_fs = decim_0_output_fs / 2;
+    constexpr size_t decim_1_output_fs =
+        audio_decim_0_output_fs / translating_decim_1.decimation_factor;
     constexpr size_t decim_2_input_fs = decim_1_output_fs;
     constexpr size_t decim_2_output_fs = decim_2_input_fs / decim_2_decimation_factor;
 
     constexpr size_t channel_filter_input_fs = decim_2_output_fs;
     // const size_t channel_filter_output_fs = channel_filter_input_fs / channel_filter_decimation_factor;
 
-    decim_0.configure(message.decim_0_filter.taps);
-    decim_1.configure(message.decim_1_filter.taps);
+    configure_fs4(message.decim_0_filter.taps);
+    audio_decim_0.configure(taps_audio_wide_halfband_0.taps);
+    translating_decim_1.configure(
+        message.decim_1_filter.taps, audio_decim_0_output_fs);
     decim_2.configure(message.decim_2_filter.taps, decim_2_decimation_factor);
     channel_filter.configure(message.channel_filter.taps, channel_filter_decimation_factor);
     channel_filter_low_f = message.channel_filter.low_frequency_normalized * channel_filter_input_fs;
@@ -124,10 +195,19 @@ void NarrowbandAMAudio::configure(const AMConfigureMessage& message) {
     channel_filter_transition = message.channel_filter.transition_normalized * channel_filter_input_fs;
 
     modulation_ssb = (int)message.modulation;  // now sending by message , 3 types of AM demod :   enum class Modulation : int32_t {DSB = 0, SSB = 1, SSB_FM = 2}
-    channel_spectrum.set_decimation_factor(message.channel_spectrum_decimation_factor);
+    spectrum_decimation_factor = 2 * message.channel_spectrum_decimation_factor;
+    channel_spectrum.set_decimation_factor(1);
+    spectrum_interval_samples =
+        decim_0_output_fs / spectrum_rate_hz;
     audio_output.configure(message.audio_hpf_lpf_config);  // hpf in all AM demod modes (AM-6K/9K, USB/LSB,DSB), except Wefax (lpf there).
+    squelch_level = message.squelch_level;
 
     configured = true;
+}
+
+void NarrowbandAMAudio::ddc_config(const AudioDDCConfigMessage& message) {
+    translating_decim_1.set_frequency(message.frequency);
+    channel_spectrum.set_channel_filter_offset(message.frequency);
 }
 
 void NarrowbandAMAudio::capture_config(const CaptureConfigMessage& message) {

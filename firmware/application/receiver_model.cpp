@@ -57,6 +57,12 @@ static constexpr std::array<baseband::AMConfig, 12> am_configs{{
     {taps_6k0_narrow_decim_1, taps_6k0_decim_2, taps_2k6_usb_wefax_channel, AMConfigureMessage::Modulation::SSB_FM, apt_audio_12k_lpf_1500hz_config, (int)AMConfigureMessage::Zoom_waterfall::ZOOM_x_2},  // SSB USB+FM  to demod. Subcarrier FM Audio Tones to get APT Weather Fax with waterfall zoom x 2 (we need taps_6k0_narrow_decim_1 to minimize aliasing)
 }};
 
+AMConfigureMessage::Zoom_waterfall spectrum_zoom_for_am_config(const size_t index) {
+    return index < am_configs.size()
+               ? (AMConfigureMessage::Zoom_waterfall)am_configs[index].spectrum_decimation_factor
+               : AMConfigureMessage::Zoom_waterfall::ZOOM_x_1;
+}
+
 static constexpr std::array<baseband::NBFMConfig, 4> nbfm_configs{{
     {taps_4k25_decim_0, taps_4k25_decim_1, taps_4k25_channel, 2500},
     {taps_11k0_decim_0, taps_11k0_decim_1, taps_11k0_channel, 2500},
@@ -85,6 +91,15 @@ rf::Frequency ReceiverModel::target_frequency() const {
 void ReceiverModel::set_target_frequency(rf::Frequency f) {
     persistent_memory::set_target_frequency(f);
     settings_.frequency_app_override = f;
+    update_tuning_frequency();
+}
+
+void ReceiverModel::set_target_frequency_with_hidden_offset(
+    rf::Frequency f,
+    rf::Frequency offset) {
+    persistent_memory::set_target_frequency(f);
+    settings_.frequency_app_override = f;
+    hidden_offset = offset;
     update_tuning_frequency();
 }
 
@@ -157,6 +172,17 @@ uint8_t ReceiverModel::am_configuration() const {
 void ReceiverModel::set_am_configuration(uint8_t n) {
     if (n < am_configs.size()) {
         settings_.am_config_index = n;
+        am_spectrum_zoom_ = spectrum_zoom_for_am_config(n);
+        update_modulation();
+    }
+}
+
+void ReceiverModel::set_am_configuration(
+    uint8_t n,
+    AMConfigureMessage::Zoom_waterfall spectrum_zoom) {
+    if (n < am_configs.size()) {
+        settings_.am_config_index = n;
+        am_spectrum_zoom_ = spectrum_zoom;
         update_modulation();
     }
 }
@@ -168,6 +194,17 @@ uint8_t ReceiverModel::amfm_configuration() const {
 void ReceiverModel::set_amfm_configuration(uint8_t n) {
     if (n < am_configs.size()) {
         settings_.amfm_config_index = n;
+        am_spectrum_zoom_ = spectrum_zoom_for_am_config(n);
+        update_modulation();
+    }
+}
+
+void ReceiverModel::set_amfm_configuration(
+    uint8_t n,
+    AMConfigureMessage::Zoom_waterfall spectrum_zoom) {
+    if (n < am_configs.size()) {
+        settings_.amfm_config_index = n;
+        am_spectrum_zoom_ = spectrum_zoom;
         update_modulation();
     }
 }
@@ -214,6 +251,15 @@ void ReceiverModel::set_squelch_level(uint8_t v) {
     update_modulation();
 }
 
+uint8_t ReceiverModel::am_squelch_level() const {
+    return settings_.am_squelch_level;
+}
+
+void ReceiverModel::set_am_squelch_level(uint8_t v) {
+    settings_.am_squelch_level = v;
+    update_modulation();
+}
+
 void ReceiverModel::set_antenna_bias() {
     update_antenna_bias();
 }
@@ -244,10 +290,24 @@ void ReceiverModel::enable() {
     radio::set_direction(rf::Direction::Receive);
 
 #ifdef PRALINE
-    /* Anchor the Common Mode Voltage (VCM) to 1.2V.
-     * This stabilizes the electrical floor of the I/Q signals.
-     */
-    radio::set_rx_buff_vcm(1);
+    /* MAX2831 RX IQ common-mode voltage (register 15).
+     *
+     * 0 = 1.1 V, 1 = 1.2 V, 2 = 1.3 V, 3 = 1.45 V.
+     *
+     * The reference firmware leaves this alone: max2831.c's default register
+     * table has reg 15 = 0x0145 (1.1 V) and the line that would raise it is
+     * commented out ("maximum rx output common-mode voltage"). Mayhem used to
+     * force 1.2 V here on the theory that it "stabilises the electrical floor
+     * of the I/Q signals" -- plausible, but never measured, and it was the
+     * last remaining RF-path setting where this branch disagreed with the
+     * configuration that is proven to receive ADS-B on this board.
+     *
+     * Set to 0 to match the reference (writing 1.1 V is a no-op against the
+     * power-on default), or back to 1 to restore the old Mayhem behaviour.
+     * If reception measurably worsens, put it back to 1 and say so -- neither
+     * value has been verified on hardware. */
+#define PRALINE_RX_IQ_VCM 0
+    radio::set_rx_buff_vcm(PRALINE_RX_IQ_VCM);
 #endif
 
     update_tuning_frequency();
@@ -265,6 +325,7 @@ void ReceiverModel::enable() {
 
 void ReceiverModel::disable() {
     enabled_ = false;
+    am_spectrum_zoom_ = spectrum_zoom_for_am_config(settings_.am_config_index);
 
     // TODO: Responsibility for enabling/disabling the radio is muddy.
     // Some happens in ReceiverModel, some inside radio namespace.
@@ -273,6 +334,12 @@ void ReceiverModel::disable() {
 
 void ReceiverModel::initialize() {
     settings_ = settings_t{};
+#ifdef PRALINE
+    narrowband_capture_enabled_ = false;
+#endif
+    hidden_offset = 0;
+    application_fs4_direction_ = RxFs4Direction::Down;
+    am_spectrum_zoom_ = spectrum_zoom_for_am_config(settings_.am_config_index);
 }
 
 void ReceiverModel::set_configuration_without_update(
@@ -286,6 +353,7 @@ void ReceiverModel::set_configuration_without_update(
     settings_.mode = new_mode;
     settings_.frequency_step = new_frequency_step;
     settings_.am_config_index = new_am_config_index;
+    am_spectrum_zoom_ = spectrum_zoom_for_am_config(new_am_config_index);
     settings_.nbfm_config_index = new_nbfm_config_index;
     settings_.wfm_config_index = new_wfm_config_index;
     settings_.wfmam_config_index = new_wfmam_config_index;
@@ -302,18 +370,52 @@ void ReceiverModel::configure_from_app_settings(
     settings_.squelch_level = settings.squelch;
 }
 
+#ifdef PRALINE
+void ReceiverModel::set_narrowband_capture_enabled(bool enabled) {
+    if (narrowband_capture_enabled_ == enabled)
+        return;
+    narrowband_capture_enabled_ = enabled;
+    update_tuning_frequency();
+}
+
+rx_afe::CapturePolicy ReceiverModel::capture_afe_policy() const {
+    return rx_afe::capture_policy(sampling_rate(),
+                                  narrowband_capture_enabled_ && modulation() == Mode::Capture);
+}
+#endif
+
 int32_t ReceiverModel::tuning_offset() {
     if ((modulation() == Mode::SpectrumAnalysis)) {
         return 0;
     } else {
-        return -(sampling_rate() / 4);
+        const int32_t quarter_rate = static_cast<int32_t>(sampling_rate() / 4);
+        const rf::Frequency effective_frequency = target_frequency() + hidden_offset;
+        return baseband::supports_rx_fs4() && effective_frequency - quarter_rate < 0
+                   ? quarter_rate
+                   : -quarter_rate;
     }
 }
 
 void ReceiverModel::update_tuning_frequency() {
-    // TODO: use positive offset if freq < offset.
     if (enabled_) {
-        radio::set_tuning_frequency(target_frequency() + hidden_offset + tuning_offset());
+        const auto offset = tuning_offset();
+#ifdef PRALINE
+        const auto afe_policy = capture_afe_policy();
+        if (!radio::set_tuning_frequency(target_frequency() + hidden_offset + offset, afe_policy.disable_quarter_shift))
+#else
+        if (!radio::set_tuning_frequency(target_frequency() + hidden_offset + offset))
+#endif
+            return;
+
+        if (modulation() != Mode::SpectrumAnalysis && baseband::supports_rx_fs4()) {
+            application_fs4_direction_ = offset > 0 ? RxFs4Direction::Up : RxFs4Direction::Down;
+            // Re-send on enable too: the active processor may have restarted.
+            baseband::set_rx_fs4_direction(application_fs4_direction_);
+        }
+#ifdef PRALINE
+        // A tune can change the FPGA shift (including the special zero entry).
+        update_baseband_bandwidth();
+#endif
     }
 }
 
@@ -326,48 +428,40 @@ void ReceiverModel::update_baseband_bandwidth() {
     if (enabled_) {
 #ifdef PRALINE
         /*
-         * PRALINE LPF bandwidth calculation from GSG hackrf_usb radio.c
+         * PRALINE LPF bandwidth, ported from auto_bandwidth() in
+         * hackrf/firmware/common/radio.c:
          *
-         * The LPF should be set to capture the desired signal bandwidth
-         * while the FPGA decimation filter handles anti-aliasing.
+         *   bb_bandwidth  = sample_rate * 3 / 4
+         *   lpf_bandwidth = bb_bandwidth + offset_hz * 2
          *
-         * For most modes: LPF = (output_sample_rate * 3) / 8
-         * For quarter-shift: add offset for shifted spectrum
+         * where offset_hz is the quarter-rate shift, i.e. afe_rate / 4 when a
+         * shift is in use. The doubling is because the wanted signal sits
+         * offset from the analogue centre, so the analogue filter has to stay
+         * open out to that offset on the far side too.
          *
-         * Note: MAX2831 minimum LPF is 11.6 MHz, so for narrow sample rates
-         * the hardware limit applies and FPGA filter does the real work.
+         * The previous version used /8 in both places and read the shift from
+         * bits 2-3 of FPGA register 1, which do not exist in the gateware, so
+         * it always took the no-shift branch. At the ADS-B rate that asked for
+         * 750 kHz, which qualified for the external narrowband AA filter
+         * (MAX2831::set_lpf_rf_bandwidth_rx), squeezing the RX path shut. The
+         * reference asks for 17.5 MHz at the same rate and the AA filter stays
+         * out of circuit.
          */
 
         uint32_t sample_rate = sampling_rate();
         uint8_t resampling_n = portapack::clock_manager.get_resampling_n();
         uint32_t afe_rate = sample_rate << resampling_n;
 
-        // Base LPF: enough to capture desired bandwidth
-        uint32_t lpf_bandwidth = (sample_rate * 3) / 8;
+        const auto afe_policy = capture_afe_policy();
+        uint32_t lpf_bandwidth = afe_policy.useful_bandwidth_hz;
 
-        // Check if quarter-shift is enabled (FPGA register 1, bits 2-3)
-        uint32_t fpga_ctrl = radio::debug::fpga::register_read(1);
-        uint8_t quarter_shift = (fpga_ctrl >> 2) & 0x03;
-
+        const uint8_t quarter_shift = radio::debug::get_cached_quarter_shift();
         if (quarter_shift != 0) {
-            // Quarter-shift moves spectrum by AFE_rate/4, need wider LPF
-            uint32_t offset = afe_rate / 8;
+            const uint32_t offset = afe_rate / 4;
             lpf_bandwidth += offset * 2;
         }
 
-        // For best anti-alias performance, also consider AFE Nyquist
-        // If our calculated LPF is below MAX2831 minimum, it doesn't matter
-        // But if we can set LPF to just below AFE Nyquist, that's optimal
-        uint32_t afe_nyquist = afe_rate / 2;
-
-        // Use the larger of: signal bandwidth requirement OR Nyquist protection
-        // (but MAX2831 driver will clamp to its available settings anyway)
-        if (lpf_bandwidth < afe_nyquist) {
-            // Set LPF close to Nyquist for maximum alias rejection
-            lpf_bandwidth = (afe_nyquist * 9) / 10;  // 90% of Nyquist
-        }
-
-        radio::set_baseband_filter_bandwidth_rx(lpf_bandwidth);
+        radio::set_baseband_filter_bandwidth_rx(lpf_bandwidth, afe_policy.narrowband);
 #else
         radio::set_baseband_filter_bandwidth_rx(baseband_bandwidth());
 #endif
@@ -440,11 +534,11 @@ void ReceiverModel::update_modulation() {
 }
 
 void ReceiverModel::update_am_configuration() {
-    am_configs[am_configuration()].apply();
+    am_configs[am_configuration()].apply(am_spectrum_zoom_, am_squelch_level());
 }
 
 void ReceiverModel::update_amfm_configuration() {
-    am_configs[amfm_configuration()].apply();  // update with different index for Wefax.
+    am_configs[amfm_configuration()].apply(am_spectrum_zoom_);  // update with different index for Wefax.
 }
 
 void ReceiverModel::update_nbfm_configuration() {

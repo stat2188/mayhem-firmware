@@ -50,11 +50,30 @@ void NarrowbandFMAudio::execute(const buffer_c8_t& buffer) {
         return;
     }
 
+    // Only the processing thread applies frequency-only direction changes.
+    if (requested_fs4_direction_.load(std::memory_order_relaxed) != applied_fs4_direction_)
+        configure_fs4(decim_0_taps_);
+
     const auto decim_0_out = decim_0.execute(buffer, dst_buffer);
-    const auto decim_1_out = decim_1.execute(decim_0_out, dst_buffer);
+    const auto audio_decim_0_out = audio_decim_0.execute(decim_0_out, dst_buffer);
 
-    channel_spectrum.feed(decim_1_out, channel_filter_low_f, channel_filter_high_f, channel_filter_transition);
+    spectrum_samples += decim_0_out.count;
+    if (!spectrum_capture_active &&
+        spectrum_samples >= spectrum_interval_samples) {
+        spectrum_samples -= spectrum_interval_samples;
+        spectrum_capture_active = channel_spectrum.start_capture(2);
+    }
 
+    if (spectrum_capture_active &&
+        channel_spectrum.feed(
+            audio_decim_0_out,
+            channel_filter_low_f,
+            channel_filter_high_f,
+            channel_filter_transition)) {
+        spectrum_capture_active = false;
+    }
+
+    const auto decim_1_out = translating_decim_1.execute(audio_decim_0_out, dst_buffer);
     const auto channel_out = channel_filter.execute(decim_1_out, dst_buffer);
 
     feed_channel_stats(channel_out);
@@ -122,8 +141,26 @@ void NarrowbandFMAudio::execute(const buffer_c8_t& buffer) {
     }
 }
 
+void NarrowbandFMAudio::configure_fs4(const std::array<int16_t, 24>& taps) {
+    // Keep the short first-stage update coherent with the processing thread.
+    chSysLock();
+    decim_0_taps_ = taps;
+    const auto direction = requested_fs4_direction_.load(std::memory_order_relaxed);
+    using Shift = dsp::decimate::FIRC8xR16x24FS4Decim4::Shift;
+    decim_0.configure(decim_0_taps_, 33554432,
+                      direction == RxFs4Direction::Up ? Shift::Up : Shift::Down);
+    applied_fs4_direction_ = direction;
+    chSysUnlock();
+}
+
 void NarrowbandFMAudio::on_message(const Message* const message) {
     switch (message->id) {
+        case Message::ID::RxFs4Config:
+            requested_fs4_direction_.store(
+                static_cast<const RxFs4ConfigMessage*>(message)->direction,
+                std::memory_order_relaxed);
+            break;
+
         case Message::ID::UpdateSpectrum:
         case Message::ID::SpectrumStreamingConfig:
             channel_spectrum.on_message(message);
@@ -141,6 +178,10 @@ void NarrowbandFMAudio::on_message(const Message* const message) {
             pitch_rssi_config(*reinterpret_cast<const PitchRSSIConfigureMessage*>(message));
             break;
 
+        case Message::ID::AudioDDCConfig:
+            ddc_config(*reinterpret_cast<const AudioDDCConfigMessage*>(message));
+            break;
+
         default:
             break;
     }
@@ -150,28 +191,37 @@ void NarrowbandFMAudio::configure(const NBFMConfigureMessage& message) {
     constexpr size_t decim_0_input_fs = baseband_fs;
     constexpr size_t decim_0_output_fs = decim_0_input_fs / decim_0.decimation_factor;
 
-    constexpr size_t decim_1_input_fs = decim_0_output_fs;
-    constexpr size_t decim_1_output_fs = decim_1_input_fs / decim_1.decimation_factor;
-
+    constexpr size_t audio_decim_0_output_fs = decim_0_output_fs / 2;
+    constexpr size_t decim_1_output_fs =
+        audio_decim_0_output_fs / translating_decim_1.decimation_factor;
     constexpr size_t channel_filter_input_fs = decim_1_output_fs;
     const size_t channel_filter_output_fs = channel_filter_input_fs / message.channel_decimation;
 
     const size_t demod_input_fs = channel_filter_output_fs;
 
-    decim_0.configure(message.decim_0_filter.taps);
-    decim_1.configure(message.decim_1_filter.taps);
+    configure_fs4(message.decim_0_filter.taps);
+    audio_decim_0.configure(taps_audio_wide_halfband_0.taps);
+    translating_decim_1.configure(
+        message.decim_1_filter.taps, audio_decim_0_output_fs);
     channel_filter.configure(message.channel_filter.taps, message.channel_decimation);
     demod.configure(demod_input_fs, message.deviation);
     channel_filter_low_f = message.channel_filter.low_frequency_normalized * channel_filter_input_fs;
     channel_filter_high_f = message.channel_filter.high_frequency_normalized * channel_filter_input_fs;
     channel_filter_transition = message.channel_filter.transition_normalized * channel_filter_input_fs;
-    channel_spectrum.set_decimation_factor(1.0f);
+    channel_spectrum.set_decimation_factor(1);
+    spectrum_interval_samples =
+        decim_0_output_fs / spectrum_rate_hz;
     audio_output.configure(message.audio_hpf_config, message.audio_deemph_config, (float)message.squelch_level / 100.0);
 
     hpf.configure(audio_24k_hpf_30hz_config);
     ctcss_filter.configure(taps_64_lp_025_025.taps);
 
     configured = true;
+}
+
+void NarrowbandFMAudio::ddc_config(const AudioDDCConfigMessage& message) {
+    translating_decim_1.set_frequency(message.frequency);
+    channel_spectrum.set_channel_filter_offset(message.frequency);
 }
 
 void NarrowbandFMAudio::pitch_rssi_config(const PitchRSSIConfigureMessage& message) {

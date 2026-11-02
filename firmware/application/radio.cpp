@@ -144,6 +144,11 @@ static rf::Direction cached_direction = rf::Direction::Receive;
 static bool cached_rf_amp = false;
 static int_fast8_t cached_lna_gain = 0;
 static int_fast8_t cached_vga_gain = 0;
+/* FPGA quarter-rate shift mode currently programmed, in gateware encoding
+ * (0b00 none / 0b11 up / 0b01 down). The baseband filter width depends on it,
+ * so ReceiverModel reads it back through get_quarter_shift(). */
+static uint8_t cached_quarter_shift = 0;
+static bool rx_aa_override_active = false;
 #endif
 
 void init() {
@@ -182,18 +187,15 @@ void init() {
 
     fpga_set_mode(FPGA_MODE_RX);
 
-    // These FPGA registers control DC_BLOCK, Q-Inv, QUARTER SHIFT, and Decimation.
-    fpga_debug_register_write(FPGA_REG_CTRL, FPGA_CTRL_DC_BLOCK_EN);  // DC_BLOCK=1, QUARTER_SHIFT=0, Q_INVERT=0
-    fpga_debug_register_write(FPGA_REG_DECIM, 0x00);                  // RX_DECIM=No Decim
-
-    // RX Mode: Register 3 is RX Digital Gain. Start with 0dB (no shift).
-    fpga_debug_register_write(FPGA_REG_RX_DIGITAL_GAIN, FPGA_RX_DEFAULT_DIGITAL_GAIN);
-
-    /* RX Mode: Initialize DC Block parameters to standard Praline values.
-     * 0x04 Width and 0x08 Adapt Rate are typical for 40MHz stability.
-     */
-    fpga_debug_register_write(FPGA_REG_RX_DC_BLOCK_WIDTH, FPGA_RX_DEFAULT_DC_WIDTH);
-    fpga_debug_register_write(FPGA_REG_RX_DC_ADAPT_RATE, FPGA_RX_DEFAULT_ADAPT_RATE);
+    /* Boot register state, matching fpga_init() in hackrf/firmware/common/fpga.c:
+     * DC block on, no PRBS, no external trigger, no quarter shift, TX NCO off.
+     * The decimation ratio and the quarter shift are programmed later by
+     * ClockManager::set_sampling_frequency() and set_tuning_frequency(). */
+    fpga_debug_register_write(FPGA_REG_CTRL, FPGA_CTRL_DC_BLOCK_EN);
+    fpga_debug_register_write(FPGA_REG_DECIM, 0x00);     // RX_DECIM = no decimation
+    fpga_debug_register_write(FPGA_REG_RX_PSTEP, 0x00);  // quarter shift off
+    fpga_debug_register_write(FPGA_REG_TX_CONTROL, 0x00);
+    cached_quarter_shift = 0;
 
     ssp1_arbiter.invalidate();
     chThdSleepMilliseconds(10);  // Let FPGA registers settle
@@ -224,13 +226,13 @@ void set_direction(const rf::Direction new_direction) {
         fpga_debug_register_write(FPGA_REG_TX_PHASE_STEP, 0x00);
     } else {
         fpga_set_mode(FPGA_MODE_RX);
-        // RX Mode: Ensure NCO is disabled and reset digital gain
-        fpga_debug_register_write(FPGA_REG_RX_DIGITAL_GAIN, FPGA_RX_DEFAULT_DIGITAL_GAIN);
-        /* RX Mode: Initialize DC Block parameters to standard Praline values.
-         * 0x04 Width and 0x08 Adapt Rate are typical for 40MHz stability.
-         */
-        fpga_debug_register_write(FPGA_REG_RX_DC_BLOCK_WIDTH, FPGA_RX_DEFAULT_DC_WIDTH);
-        fpga_debug_register_write(FPGA_REG_RX_DC_ADAPT_RATE, FPGA_RX_DEFAULT_ADAPT_RATE);
+        /* RX Mode: DC block on, TX NCO off. The quarter shift is re-applied by
+         * set_tuning_frequency(); clear it here so a stale TX/RX transition
+         * cannot leave a rotation programmed with no matching LO offset. */
+        fpga_debug_register_write(FPGA_REG_CTRL, FPGA_CTRL_DC_BLOCK_EN);
+        fpga_debug_register_write(FPGA_REG_TX_CONTROL, 0x00);
+        fpga_debug_register_write(FPGA_REG_RX_PSTEP, 0x00);
+        cached_quarter_shift = 0;
     }
 #endif
 
@@ -284,7 +286,19 @@ void set_direction(const rf::Direction new_direction) {
         led_tx.setActive();
 }
 
+static bool fast_retune = false;
+
+void set_fast_retune(const bool enabled) {
+    fast_retune = enabled;
+}
+
 bool set_tuning_frequency(const rf::Frequency frequency) {
+#ifdef PRALINE
+    return set_tuning_frequency(frequency, false);
+}
+
+bool set_tuning_frequency(const rf::Frequency frequency, const bool disable_afe_quarter_shift) {
+#endif
     rf::Frequency final_frequency = frequency;
     // if converter feature is enabled
     if (portapack::persistent_memory::config_converter()) {
@@ -309,7 +323,20 @@ bool set_tuning_frequency(const rf::Frequency frequency) {
             final_frequency = final_frequency + portapack::persistent_memory::config_freq_rx_correction();
     }
 
+#ifdef PRALINE
+    /* The PRALINE tuning tables offset the analogue passband by a quarter of
+     * the ADC sample rate and have the FPGA rotate it back to DC, so the
+     * planner needs to know the AFE rate. See tuning.cpp. */
+    const uint32_t afe_rate = portapack::clock_manager.get_sampling_frequency()
+                              << portapack::clock_manager.get_resampling_n();
+    const auto tuning_config = tuning::config::create(
+        final_frequency,
+        // Zero only the planner input: real clocks and decimation stay intact.
+        (direction == rf::Direction::Receive && disable_afe_quarter_shift) ? 0 : afe_rate,
+        direction == rf::Direction::Transmit);
+#else
     const auto tuning_config = tuning::config::create(final_frequency);
+#endif
     if (tuning_config.is_valid()) {
         first_if.disable();
 
@@ -318,8 +345,9 @@ bool set_tuning_frequency(const rf::Frequency frequency) {
             first_if.set_frequency(tuning_config.first_lo_frequency);
             first_if.enable();
 #ifdef PRALINE
-            first_if.flush();            // Force register write with reference clock present
-            chThdSleepMilliseconds(10);  // Allow PLL to settle
+            first_if.flush();  // Force register write with reference clock present
+            if (!fast_retune)
+                chThdSleepMilliseconds(10);  // Allow PLL to settle
 #endif
         }
 
@@ -338,6 +366,22 @@ bool set_tuning_frequency(const rf::Frequency frequency) {
         } else {
             LPC_GPIO->CLR[0] = (1 << 13);  // SGPIO12 = 0 (Q normal)
         }
+
+        /* Program the FPGA's quarter-rate shift to match the offset the tuning
+         * table just applied to the analogue centre frequency. The gateware
+         * (hackrf/firmware/fpga/top/standard.py) takes both bits from the top
+         * of register 0x03 (rx_pstep):
+         *   rx_pstep[6] -> quarter_shift.enable
+         *   rx_pstep[7] -> quarter_shift.up
+         * which is exactly fpga_set_rx_quarter_shift_mode() in
+         * hackrf/firmware/common/fpga.c: write (mode & 0b11) << 6.
+         *
+         * These two settings MUST be programmed together. Tuning off-centre
+         * without the rotation puts the signal outside the decimation filter's
+         * passband and it disappears entirely; rotating without the offset
+         * moves the wanted signal off DC by the same amount. */
+        cached_quarter_shift = tuning_config.quarter_shift;
+        fpga_debug_register_write(FPGA_REG_RX_PSTEP, (cached_quarter_shift & 0b11) << 6);
 
         ssp1_arbiter.invalidate();
 #else
@@ -376,8 +420,21 @@ void set_tx_gain(const int_fast8_t db) {
 }
 
 void set_baseband_filter_bandwidth_rx(const uint32_t bandwidth_minimum) {
+#ifdef PRALINE
+    set_baseband_filter_bandwidth_rx(bandwidth_minimum, rx_afe::NarrowbandPolicy::Auto);
+#else
     second_if->set_lpf_rf_bandwidth_rx(bandwidth_minimum);
+#endif
 }
+
+#ifdef PRALINE
+void set_baseband_filter_bandwidth_rx(const uint32_t bandwidth_minimum, rx_afe::NarrowbandPolicy policy) {
+    if (direction != rf::Direction::Receive)
+        policy = rx_afe::NarrowbandPolicy::Auto;
+    rx_aa_override_active = policy != rx_afe::NarrowbandPolicy::Auto;
+    second_if_max2831.set_lpf_rf_bandwidth_rx(bandwidth_minimum, policy);
+}
+#endif
 
 void set_baseband_filter_bandwidth_tx(const uint32_t bandwidth_minimum) {
     second_if->set_lpf_rf_bandwidth_tx(bandwidth_minimum);
@@ -418,6 +475,12 @@ void set_rx_max283x_iq_phase_calibration(const size_t v) {
 }
 
 void disable() {
+#ifdef PRALINE
+    if (rx_aa_override_active) {
+        gpio_control::aa_en.setInactive();
+        rx_aa_override_active = false;
+    }
+#endif
     if (direction == rf::Direction::Transmit && baseband::is_image_running()) {
         static constexpr uint32_t radio_tx_drain_timeout_ms = 100;
         shared_memory.radio_tx_drain = 1;  // Request drain of the current DMA queue.
@@ -468,6 +531,10 @@ int_fast8_t get_cached_lna_gain() {
 
 int_fast8_t get_cached_vga_gain() {
     return cached_vga_gain;
+}
+
+uint8_t get_cached_quarter_shift() {
+    return cached_quarter_shift;
 }
 #endif
 
@@ -570,18 +637,11 @@ void register_write(const size_t register_number, uint32_t value) {
 void init() {
     fpga_set_mode(FPGA_MODE_RX);
 
-    // These FPGA registers control DC_BLOCK, Q-Inv, QUARTER SHIFT, and Decimation.
-    fpga_debug_register_write(FPGA_REG_CTRL, FPGA_CTRL_DC_BLOCK_EN);  // DC_BLOCK=1, QUARTER_SHIFT=0, Q_INVERT=0
-    fpga_debug_register_write(FPGA_REG_DECIM, 0x00);                  // RX_DECIM=No Decim
-
-    // RX Mode: Register 3 is RX Digital Gain. Start with 0dB (no shift).
-    fpga_debug_register_write(FPGA_REG_RX_DIGITAL_GAIN, FPGA_RX_DEFAULT_DIGITAL_GAIN);
-
-    /* RX Mode: Initialize DC Block parameters to standard Praline values.
-     * 0x04 Width and 0x08 Adapt Rate are typical for 40MHz stability.
-     */
-    fpga_debug_register_write(FPGA_REG_RX_DC_BLOCK_WIDTH, FPGA_RX_DEFAULT_DC_WIDTH);
-    fpga_debug_register_write(FPGA_REG_RX_DC_ADAPT_RATE, FPGA_RX_DEFAULT_ADAPT_RATE);
+    /* Same boot state as fpga_init() in hackrf/firmware/common/fpga.c. */
+    fpga_debug_register_write(FPGA_REG_CTRL, FPGA_CTRL_DC_BLOCK_EN);
+    fpga_debug_register_write(FPGA_REG_DECIM, 0x00);     // RX_DECIM = no decimation
+    fpga_debug_register_write(FPGA_REG_RX_PSTEP, 0x00);  // quarter shift off
+    fpga_debug_register_write(FPGA_REG_TX_CONTROL, 0x00);
 
     ssp1_arbiter.invalidate();  // Force arbiter to reconfigure on next transfer
 }

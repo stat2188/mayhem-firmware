@@ -43,6 +43,7 @@
 #include "dsp_fir_taps.hpp"
 #include "dsp_iir.hpp"
 #include "fifo.hpp"
+#include "spec_an_shared.hpp"
 
 #include "utility.hpp"
 
@@ -170,6 +171,15 @@ class Message {
         HunterStop = 112,
         TetraBsch = 113,
         TetraDnb = 114,
+        AudioDDCConfig = 115,
+        RxFs4Config = 116,
+        FT8Packet = 117,
+        FT8RxStatus = 118,
+        RdsData = 119,
+        SpecAnConfig = 120,
+        SpecAnCaptured = 121,
+        SpecAnSlice = 122,
+        WMBusPacketMessageID = 123,
         MAX
     };
 
@@ -310,6 +320,28 @@ class SpectrumStreamingConfigMessage : public Message {
     Mode mode{Mode::Stopped};
 };
 
+// Application sample-rate translation, independent of PRALINE's AFE shift.
+enum class RxFs4Direction : uint8_t { Down,
+                                      Up };
+
+class RxFs4ConfigMessage : public Message {
+   public:
+    constexpr RxFs4ConfigMessage(RxFs4Direction direction)
+        : Message{ID::RxFs4Config}, direction{direction} {}
+
+    const RxFs4Direction direction;
+};
+
+class AudioDDCConfigMessage : public Message {
+   public:
+    constexpr AudioDDCConfigMessage(int32_t frequency)
+        : Message{ID::AudioDDCConfig},
+          frequency{frequency} {
+    }
+
+    int32_t frequency{0};
+};
+
 class WidebandSpectrumConfigMessage : public Message {
    public:
     constexpr WidebandSpectrumConfigMessage(
@@ -357,6 +389,7 @@ class AudioSpectrumMessage : public Message {
 struct ChannelSpectrum {
     std::array<uint8_t, 256> db{{0}};
     uint32_t sampling_rate{0};
+    int32_t channel_filter_offset{0};
     int32_t channel_filter_low_frequency{0};
     int32_t channel_filter_high_frequency{0};
     int32_t channel_filter_transition{0};
@@ -407,6 +440,55 @@ class EPIRBRXConfig : public Message {
     bool spectrum_on = false;
     bool audio_on = true;
     uint8_t squelch{50};
+};
+
+/* One decoded FT8 transmission, already unpacked to text by the baseband. */
+class FT8PacketMessage : public Message {
+   public:
+    /* Longest text an FT8 payload unpacks to: callsign[13], space, callsign[13], space,
+     * report[6], terminator. */
+    static constexpr size_t text_length = 35;
+
+    constexpr FT8PacketMessage(
+        const char* message_text,
+        int16_t audio_frequency)
+        : Message{ID::FT8Packet},
+          text{},
+          frequency{audio_frequency} {
+        size_t i = 0;
+        for (; i < text_length - 1 && message_text[i] != '\0'; i++)
+            text[i] = message_text[i];
+        text[i] = '\0';
+    }
+
+    char text[text_length];
+    /* Audio frequency inside the 200-2500 Hz passband. Every station on the band shares
+     * one dial and picks its own slot, so this is what places a decode in the passband. */
+    int16_t frequency;
+};
+
+/* Sent once per 15 s slot so the UI can tell the user whether the receiver has found
+ * the slot boundary; an unsynchronised FT8 receiver decodes nothing and looks identical
+ * to a dead band. */
+class FT8RxStatusMessage : public Message {
+   public:
+    enum class SyncState : uint8_t {
+        Searching = 0,  // Nothing above the noise; hunting for the slot boundary
+        Heard = 1,      // An FT8 transmission is in the passband but has not decoded
+        Syncing = 2,    // Boundary found, walking the sub-symbol phase
+        Locked = 3,     // Tracking the slot
+    };
+
+    constexpr FT8RxStatusMessage(
+        SyncState sync_state,
+        uint8_t decodes)
+        : Message{ID::FT8RxStatus},
+          state{sync_state},
+          decode_count{decodes} {
+    }
+
+    SyncState state;
+    uint8_t decode_count;
 };
 
 class TPMSPacketMessage : public Message {
@@ -716,6 +798,8 @@ class AMConfigureMessage : public Message {
     enum class Zoom_waterfall : size_t {
         ZOOM_x_1 = 1,
         ZOOM_x_2 = 2,
+        ZOOM_x_3 = 4,
+        ZOOM_x_4 = 8,
     };
 
     constexpr AMConfigureMessage(
@@ -725,7 +809,8 @@ class AMConfigureMessage : public Message {
         const fir_taps_complex<64> channel_filter,
         const Modulation modulation,
         const iir_biquad_config_t audio_hpf_lpf_config,
-        const size_t channel_spectrum_decimation_factor)
+        const size_t channel_spectrum_decimation_factor,
+        const uint8_t squelch_level = 0)
 
         : Message{ID::AMConfigure},
           decim_0_filter(decim_0_filter),
@@ -734,7 +819,8 @@ class AMConfigureMessage : public Message {
           channel_filter(channel_filter),
           modulation{modulation},
           audio_hpf_lpf_config(audio_hpf_lpf_config),
-          channel_spectrum_decimation_factor(channel_spectrum_decimation_factor) {
+          channel_spectrum_decimation_factor(channel_spectrum_decimation_factor),
+          squelch_level(squelch_level) {
     }
 
     const fir_taps_real<24> decim_0_filter;
@@ -744,6 +830,7 @@ class AMConfigureMessage : public Message {
     const Modulation modulation;
     const iir_biquad_config_t audio_hpf_lpf_config;
     const size_t channel_spectrum_decimation_factor;
+    const uint8_t squelch_level;  // AM channel-power squelch threshold (0 = off)
 };
 
 // TODO: Put this somewhere else, or at least the implementation part.
@@ -850,15 +937,19 @@ struct ReplayConfig {
     uint64_t baseband_bytes_received;
     FIFO<StreamBuffer*>* fifo_buffers_empty;
     FIFO<StreamBuffer*>* fifo_buffers_full;
+    // Opt-in only for native C8 direct IQ Replay. Audio/GPS default unchanged.
+    const bool input_is_c8;
 
     constexpr ReplayConfig(
         const size_t read_size,
-        const size_t buffer_count)
+        const size_t buffer_count,
+        bool input_is_c8 = false)
         : read_size{read_size},
           buffer_count{buffer_count},
           baseband_bytes_received{0},
           fifo_buffers_empty{nullptr},
-          fifo_buffers_full{nullptr} {
+          fifo_buffers_full{nullptr},
+          input_is_c8{input_is_c8} {
     }
 };
 
@@ -1025,6 +1116,9 @@ enum class OversampleRate : uint8_t {
     /* Use either to indicate there's no oversampling needed. */
     None = 1,
     x1 = None,
+
+    /* Replay-only x2; Capture's historical selection is unchanged. */
+    x2 = 2,
 
     /* Oversample rate of 4 times the sample rate. */
     x4 = 4,
@@ -1488,6 +1582,8 @@ class WeatherDataMessage : public Message {
     }
     uint8_t sensorType = 0;
     uint64_t decode_data = 0;
+    uint8_t payload_len = 0;
+    uint8_t payload[32]{};  // raw frame for protocols longer than 64 bits (WS_MAX_PAYLOAD)
 };
 
 class SubGhzDDataMessage : public Message {
@@ -2011,6 +2107,29 @@ class HunterStopMessage : public Message {
         : Message{ID::HunterStop} {}
 };
 
+struct RDSGroupMessage : public Message {
+    constexpr RDSGroupMessage(
+        uint16_t a,
+        uint16_t b,
+        uint16_t c,
+        uint16_t d,
+        bool c_prime,
+        bool is_debug,
+        uint32_t dbg_1,
+        uint32_t dbg_2)
+        : Message{ID::RdsData}, block_a{a}, block_b{b}, block_c{c}, block_d{d}, is_c_prime{c_prime}, is_debug{is_debug}, debug_1{dbg_1}, debug_2{dbg_2} {}
+
+    uint16_t block_a;
+    uint16_t block_b;
+    uint16_t block_c;
+    uint16_t block_d;
+    bool is_c_prime;
+
+    bool is_debug;
+    uint32_t debug_1;
+    uint32_t debug_2;
+};
+
 struct TetraBurstMessage : public Message {
     constexpr TetraBurstMessage(
         const uint8_t* bits,
@@ -2052,5 +2171,100 @@ struct TetraDnbMessage : public Message {
 
     // 432 TCH type-5 bits: 216 bits before the training sequence + 216 bits after.
     std::array<uint8_t, 54> payload;
+};
+/* Spectrum Analyzer ******************************************************/
+
+/* M0 -> M4, once per plan change. See spec_an_shared.hpp for the protocol. */
+class SpecAnConfigMessage : public Message {
+   public:
+    constexpr SpecAnConfigMessage(
+        spec_an::Shared* shared,
+        uint32_t sampling_rate,
+        uint16_t gen,
+        uint8_t fft_log2n,
+        uint16_t avg_blocks,
+        int16_t bin_first,
+        uint16_t bins_per_slice,
+        uint16_t slices,
+        uint64_t px_per_bin_num,
+        uint64_t px_per_bin_den,
+        spec_an::Window window,
+        spec_an::Detector detector)
+        : Message{ID::SpecAnConfig},
+          shared{shared},
+          sampling_rate{sampling_rate},
+          gen{gen},
+          fft_log2n{fft_log2n},
+          avg_blocks{avg_blocks},
+          bin_first{bin_first},
+          bins_per_slice{bins_per_slice},
+          slices{slices},
+          px_per_bin_num{px_per_bin_num},
+          px_per_bin_den{px_per_bin_den},
+          window{window},
+          detector{detector} {
+    }
+
+    spec_an::Shared* shared;
+    uint32_t sampling_rate;
+    uint16_t gen;
+    uint8_t fft_log2n;
+    uint16_t avg_blocks;     /* FFTs power-averaged per slice */
+    int16_t bin_first;       /* natural FFT bin of a slice's first bin, mod N */
+    uint16_t bins_per_slice; /* K: slice s covers global bins [s*K, (s+1)*K) */
+    uint16_t slices;
+    /* Display pixels per FFT bin, as a ratio: fs * (points - 1) / (N * span). */
+    uint64_t px_per_bin_num;
+    uint64_t px_per_bin_den;
+    spec_an::Window window;
+    spec_an::Detector detector;
+};
+
+/* M4 -> M0: samples for request `seq` are in, the tuner is free. */
+class SpecAnCapturedMessage : public Message {
+   public:
+    constexpr SpecAnCapturedMessage(uint16_t gen, uint32_t seq)
+        : Message{ID::SpecAnCaptured},
+          gen{gen},
+          seq{seq} {
+    }
+
+    uint16_t gen;
+    uint32_t seq;
+};
+
+/* M4 -> M0: display points [px_begin, px_end) of pix[sweep & 1] are final. */
+class SpecAnSliceMessage : public Message {
+   public:
+    constexpr SpecAnSliceMessage(
+        uint16_t gen,
+        uint16_t slice,
+        uint8_t sweep,
+        bool last,
+        uint16_t px_begin,
+        uint16_t px_end)
+        : Message{ID::SpecAnSlice},
+          gen{gen},
+          slice{slice},
+          sweep{sweep},
+          last{last},
+          px_begin{px_begin},
+          px_end{px_end} {
+    }
+
+    uint16_t gen;
+    uint16_t slice;
+    uint8_t sweep; /* req_sweep of the capture; pix[sweep & 1] holds the points */
+    bool last;
+    uint16_t px_begin;
+    uint16_t px_end;
+};
+
+struct WMBusPacketMessage : public Message {
+    constexpr WMBusPacketMessage()
+        : Message{ID::WMBusPacketMessageID} {}
+
+    uint16_t length = 0;
+    uint8_t data[500] = {0};
 };
 #endif /*__MESSAGE_H__*/
